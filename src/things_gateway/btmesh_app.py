@@ -13,6 +13,9 @@ from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 from src.shared import mesh_model, mesh_codes
 
+def ts():
+    return time.strftime('[%H:%M:%S]')
+
 INITIAL_STATE = 0
 IDLE_STATE = 1
 PROVISIONING_STATE = 2
@@ -20,7 +23,7 @@ RESTART_STATE = 3
 
 # USB port
 USB_PORT = '/dev/ttyUSB0'
-USB_BAUDRATE= 19200
+USB_BAUDRATE= 9600 #cần phải đồng bộ với esp32(Bon)
 
 # opcode
 OPCODE_GET_LOCAL_KEYS           = 0x01
@@ -271,7 +274,7 @@ class UART():
     
     def setup_uart(self):
         try:
-            self.ser = serial.Serial(self.port, self.baudrate)
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=5)
             time.sleep(1)
             print("Serial connection established")
         except serial.SerialException as e:
@@ -471,15 +474,20 @@ class MeshGateway():
             gw_service_interface.BtmeshDeleteNodeAck(dbus_msg)
 
     def recv_get_composition_data(self):
+        print(f'{ts()} [CHAIN 4/5] recv_get_composition_data: reading header...')
         msg = self.ser.ser.read(4)
+        if len(msg) < 4:
+            print(f'{ts()} [CHAIN 4/5] TIMEOUT reading composition header ({len(msg)}/4 bytes)')
+            return
         unicast, comp_data_len = struct.unpack('<HH', msg)
-        print(f'Unicast: {unicast}')
-        print(f'Composition data len: {comp_data_len}')
-        
+        print(f'{ts()} Unicast: {unicast}, comp_data_len: {comp_data_len}')
+
         comp_data_raw = ser.ser.read(comp_data_len + 1)
-        print()
+        if len(comp_data_raw) < comp_data_len + 1:
+            print(f'{ts()} [CHAIN 4/5] TIMEOUT reading composition body ({len(comp_data_raw)}/{comp_data_len+1} bytes)')
+            return
         if ((sum(msg) + sum(comp_data_raw) + OPCODE_GET_COMPOSITION_DATA) & 0xFF) != 0xFF:
-            print('Wrong checksum')
+            print(f'{ts()} [CHAIN 4/5] Wrong checksum in composition data')
             return
         
         size = comp_data_len - 10
@@ -545,16 +553,21 @@ class MeshGateway():
             model_app_bind_cmd(unicast, model[0][1], model[0][0])
 
     def recv_add_app_key_status(self):
+        print(f'{ts()} [CHAIN 2/5] recv_add_app_key_status: reading 4 bytes...')
         msg = self.ser.ser.read(4)
+        if len(msg) < 4:
+            print(f'{ts()} [CHAIN 2/5] TIMEOUT reading appkey status ({len(msg)}/4 bytes)')
+            return
         unicast, status, checksum = struct.unpack('<HBB', msg)
 
         if ((sum(msg) + OPCODE_ADD_APP_KEY) & 0xFF) != 0xFF:
-            print('Wrong checksum')
+            print(f'{ts()} [CHAIN 2/5] Wrong checksum in appkey status')
             return
 
-        print('-----------------Add Appkey Status---------------')
+        print(f'{ts()} -----------------Add Appkey Status---------------')
         print(f'Unicast address: {hex(unicast)}')
         print(f'Status code: {hex(status)}')
+        print(f'{ts()} [CHAIN 3/5] Sending get_composition_data_cmd to unicast {hex(unicast)}')
         get_composition_data_cmd(unicast)
 
     def recv_bind_model_status(self):
@@ -586,8 +599,7 @@ class MeshGateway():
         print(f'Vendor Model ID: {hex(company_id)} {hex(model_id)}')
         print(f'Status code: {hex(status)}')
 
-        print('------------Node Configuration Status------------')
-        print(f'Node {ele_addr} configured successfully')
+        print(f'{ts()} [CHAIN 5/5] Node {hex(ele_addr)} configured successfully')
 
     def recv_model_sub_status(self):
         msg = self.ser.ser.read(10)
@@ -743,7 +755,7 @@ class MeshGateway():
         if status == mesh_codes.REMOTE_PROVISIONER_STATUS_SUCCESS and rpr_state == mesh_codes.REMOTE_PROVISIONING_LINK_STATE_LINK_ACTIVE:
             remote_provisioning_cmd(unicast)
 
-    def recv_remote_prov_ack():
+    def recv_remote_prov_ack(self): #wrong class fixed(BON)
         msg = self.ser.ser.read(3)
         status, remote_addr, checksum = struct.unpack("<BHB", msg)
         if ((sum(msg) + OPCODE_REMOTE_PROVISIONING) & 0xFF) != 0xFF:
@@ -884,18 +896,24 @@ class MeshGateway():
             gw_service_interface.BtmeshScanResult(dbus_msg)
 
     def recv_new_node_info(self):
+        print(f'{ts()} [CHAIN 0/5] recv_new_node_info: reading 25 bytes...')
         msg = self.ser.ser.read(25)
+        if len(msg) < 25:
+            print(f'{ts()} [CHAIN 0/5] TIMEOUT reading new_node_info ({len(msg)}/25 bytes)')
+            return
         remote, uuid, unicast, rpr_srv_addr, net_idx, elem_num, checksum = struct.unpack('<B16sHHHBB', msg)
-        if (sum(msg) + OPCODE_SEND_NEW_NODE_INFO & 0xFF) != 0xFF:
-            print('Wrong checksum here')
+        if (sum(msg) + OPCODE_SEND_NEW_NODE_INFO) & 0xFF != 0xFF:
+            print(f'{ts()} [CHAIN 0/5] Wrong checksum in new_node_info')
+            return
         else:
             uuid_str = uuid.hex()
-            print('-------------------New node info-----------------')
+            print(f'{ts()} -------------------New node info-----------------')
             print(f'UUID: {uuid_str}')
             print(f'Primary unicast: {hex(unicast)}')
             print(f'NetKey id: {hex(net_idx)}')
             print(f'Element: {hex(elem_num)}')
 
+            print(f'{ts()} [CHAIN 1/5] Sending add_appkey_cmd to unicast {hex(unicast)}')
             add_appkey_cmd(unicast)                         # configuration node start here
             dbus_msg = {
                 'function': 'sensor',                      # get function from device
@@ -908,10 +926,10 @@ class MeshGateway():
             if gw_service is not None and gw_service_interface is not None:
                 gw_service_interface.BtmeshNewNodeInfo(dbus_msg)
 
-    def recv_rpr_scan_report(self):
+    def recv_rpr_scan_report(self): #never called issue, but no need to be fixed (BON)
         msg = self.ser.ser.read(30)
         unicast, rssi, uuid, oob_info, uri_hash, checksum = struct.unpack('<Hb16sHIB', msg)
-        if (sum(msg) + OPCODE_RPR_SCAN_RESULT & 0xFF) != 0xFF:
+        if (sum(msg) + OPCODE_RPR_SCAN_RESULT) & 0xFF != 0xFF: #checksum error fixed(BON)
             print('Wrong checksum here')
             return
 
@@ -986,8 +1004,9 @@ class MeshGateway():
     def recv_device_info_status(self):
         msg = self.ser.ser.read(25)
         unicast, device_name, function, tx_power, checksum = struct.unpack('<H20sBbB', msg)
-        if (sum(msg) + OPCODE_DEVICE_INFO_STATUS & 0xFF) != 0xFF:
+        if (sum(msg) + OPCODE_DEVICE_INFO_STATUS) & 0xFF != 0xFF:
             print('Wrong checksum')
+            return
         else:
             dbus_msg = {
                 'protocol': 'ble_mesh',
@@ -1147,12 +1166,15 @@ class BluetoothMeshService(dbus.service.Object):
 def dbus_call_proxy_object():
     global gw_service
     global gw_service_interface
-    
+
+    if bus is None:
+        print(f'{ts()} [DBUS] bus not ready yet')
+        return
     try:
         gw_service = bus.get_object('org.ipac.gateway', '/org/ipac/gateway')
         gw_service_interface = dbus.Interface(gw_service, 'org.ipac.gateway')
     except dbus.exceptions.DBusException:
-        print('Cannot connect to GatewayService')
+        print(f'{ts()} [DBUS] Cannot connect to GatewayService')
 
 def dbus_handler():
     DBusGMainLoop(set_as_default=True)

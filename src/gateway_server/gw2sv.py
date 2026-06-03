@@ -8,10 +8,10 @@ import time
 import os
 import threading
 from lib.logs import Log
-import dbus
-import dbus.service
-from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
+import dbus  # type: ignore
+import dbus.service  # type: ignore
+from dbus.mainloop.glib import DBusGMainLoop  # type: ignore
+from gi.repository import GLib  # type: ignore
 
 # serverTopics = {"data_request": "farm/monitor/sensor",        OK
 #                   "energy_data" : "farm/monitor/sensor",      OK
@@ -40,10 +40,17 @@ DELETE_NODE_TOPIC = "farm/node/delete"
 CONFIG_NODE_TOPIC = "farm/node/config"
 KEEPALIVE_ACK_TOPIC = "farm/monitor/alive"
 
+# # ── WiFi things topics (direct MQTT from hardware) ──────────────
+# WIFI_REGISTER_TOPIC = "farm/register"   # register / register_ack
+# WIFI_ALIVE_TOPIC    = "farm/alive"      # keep_alive / keep_alive_ack
+# WIFI_SYNC_TOPIC     = "farm/sync_node"  # gateway_add / gateway_delete + acks
+# WIFI_SENSOR_TOPIC   = "farm/sensor"     # sensor_data
+# WIFI_ACTUATOR_TOPIC = "farm/actuator"   # actuator_data / setpoint / setpoint_ack
+
 # BROKER_SERVER = '192.168.2.192'     # test broker
 # BROKER_SERVER = '192.168.88.153'     # test broker
 # BROKER_SERVER = '192.168.2.81'     # test broker
-BROKER_SERVER = '192.168.88.192'     # test broker
+BROKER_SERVER = '192.168.1.217'     # ip nhà Bon
 PORT = 1883
 KEEPALIVE = 60
 
@@ -206,6 +213,67 @@ def mqtt_recv_config_node(msg):
             elif (msg['info']['protocol'] == 'wifi'):
                 pass
 
+# ── WiFi things handlers ─────────────────────────────────────────
+# These are called when a WiFi hardware device publishes to the broker directly.
+# The gateway receives, processes, then forwards to the existing server pipeline.
+
+def wifi_recv_register(msg):
+    """
+    WiFi device registration is handled entirely by the server (scan+add UX).
+    Gateway only logs the announce — do NOT publish register_ack here.
+    """
+    mac = msg['info'].get('mac_address')
+    print(f"[WiFi] register seen from mac={mac} — server will handle ack")
+
+def wifi_recv_keepalive(msg):
+    """Thing sent keep_alive. Send keep_alive_ack back on the same topic."""
+    mac     = msg['info'].get('mac_address')
+    node_id = msg['info'].get('node_id')
+    ack = {
+        'operator': 'keep_alive_ack',
+        'status': 1,
+        'info': {'mac_address': mac, 'node_id': node_id, 'time': int(time.time())}
+    }
+    client.publish(KEEPALIVE_ACK_TOPIC, json.dumps(ack))
+    print(f"[WiFi] keep_alive_ack sent to node_id={node_id}")
+
+def wifi_recv_sync_node(msg):
+    """Receive gateway_add_ack or gateway_delete_ack from the thing."""
+    print(f"[WiFi] sync_node ack: operator={msg['operator']} mac={msg['info'].get('mac_address')}")
+
+def wifi_recv_sensor_data(msg):
+    """
+    Receive sensor_data from WiFi thing.
+    Saves to local SQLite only — server already subscribed to the same topic
+    and receives the message directly, so no re-publish needed.
+    """
+    info = msg['info']
+    try:
+        db = SqliteDAO(database.location)
+        record = database.RecordMaker({
+            'node_id': info.get('node_id'),
+            'temp':    info.get('temp')  or info.get('temperature'),
+            'hum':     info.get('hum')   or info.get('humidity'),
+            'light':   info.get('light') or info.get('light_intensity'),
+            'co2':     info.get('co2'),
+            'motion':  info.get('motion'),
+            'dust':    info.get('dust')  or info.get('dust_density'),
+        })
+        db.insertOneRecord("SensorMonitor", record['fields'], record['values'])
+    except Exception as e:
+        print(f"[WiFi] SQLite insert error: {e}")
+    print(f"[WiFi] sensor_data saved node_id={info.get('node_id')}")
+
+def wifi_recv_actuator_data(msg):
+    """
+    Receive actuator_data or setpoint_ack from WiFi thing.
+    Server already subscribed to the same topic, so no re-publish needed.
+    """
+    info = msg['info']
+    print(f"[WiFi] actuator_data received node_id={info.get('node_id')} state={info.get('state')}")
+
+# ─────────────────────────────────────────────────────────────────
+
 class GatewayClient(mqtt.Client):
     def __init__(self, topic):
         super().__init__()
@@ -230,28 +298,56 @@ class GatewayClient(mqtt.Client):
 
     def on_message(self, client, userdata, msg):
         """Called when a message has been received on a topic that the client subscribes to"""
-        # self.__msg = msg.payload.decode("utf-8")
-        self.__msg = json.loads(msg.payload.decode())
-        
+        print(f'[GW MQTT] topic={msg.topic} payload={msg.payload.decode()[:120]}')
+        try:
+            self.__msg = json.loads(msg.payload.decode())
+        except Exception as e:
+            print(f"[MQTT] Bad payload on {msg.topic}: {e}")
+            return
+
         if room_id is None:
             print("Room ID is unknown.")
             return
 
-        if (msg.topic == SCAN_DEVICE_TOPIC):
-            mqtt_recv_scan_device(self.__msg)
-        elif (msg.topic == ADD_NODE_TOPIC):
-            mqtt_recv_add_device(self.__msg)
-        elif (msg.topic == NEW_NODE_TOPIC):
-            mqtt_recv_new_node_info(self.__msg)
-        elif (msg.topic == DELETE_NODE_TOPIC):
-            mqtt_recv_delete_node(self.__msg)
-        elif (msg.topic == CONFIG_NODE_TOPIC):
-            mqtt_recv_config_node(self.__msg)
-        elif (msg.topic == KEEPALIVE_ACK_TOPIC):
-            pass
+        op = self.__msg.get('operator', '')
+        topic = msg.topic
 
-        elif (msg.topic == ACTUATOR_CONTROL_TOPIC):
+        # ── BLE mesh routing (operator-specific) ─────────────────
+        if topic == SCAN_DEVICE_TOPIC and op == 'scan_device':
+            mqtt_recv_scan_device(self.__msg)
+
+        elif topic == SCAN_DEVICE_TOPIC and op == 'register':
+            # WiFi device announcing itself — server handles registration, gateway only logs
+            wifi_recv_register(self.__msg)
+
+        elif topic == ADD_NODE_TOPIC and op == 'add_node':
+            mqtt_recv_add_device(self.__msg)
+
+        elif topic == NEW_NODE_TOPIC and op == 'new_node_info_ack':
+            mqtt_recv_new_node_info(self.__msg)
+
+        elif topic == DELETE_NODE_TOPIC and op == 'delete_node':
+            mqtt_recv_delete_node(self.__msg)
+
+        elif topic == CONFIG_NODE_TOPIC and op == 'config_node':
+            mqtt_recv_config_node(self.__msg)
+
+        elif topic == ACTUATOR_CONTROL_TOPIC and op == 'actuator_control':
             mqtt_recv_actuator_control(self.__msg)
+
+        # ── WiFi MQTT device routing ──────────────────────────────
+        # Registration (register_ack) is sent by the server, not the gateway.
+        # Gateway only caches local telemetry for WiFi nodes.
+
+        elif topic == KEEPALIVE_ACK_TOPIC and op == 'keep_alive':
+            wifi_recv_keepalive(self.__msg)
+
+        elif topic == SENSOR_DATA_TOPIC and op == 'sensor_data':
+            wifi_recv_sensor_data(self.__msg)
+
+        elif topic == ACTUATOR_DATA_TOPIC and op in ('actuator_data', 'setpoint_ack'):
+            wifi_recv_actuator_data(self.__msg)
+        # ─────────────────────────────────────────────────────────
 
     def on_publish(self, client, userdata, mid):
         '''Called when publish() function has been used'''
@@ -456,7 +552,8 @@ class GatewayService(dbus.service.Object):
                 'status': 1,
                 'info': {
                     'room_id': room_id,
-                    'node_id'
+                    #'node_id' syntax error(BON)
+                    'node_id': node_id[0][0] if node_id and node_id[0] else -1,
                     'protocol': 'ble_mesh',
                     'pid': sensor_data['data']['pid'],
                     'temp': sensor_data['data']['temp'], 
@@ -523,13 +620,15 @@ def dbus_handler():
 def mqtt_handler():
     global client
     topic = [
-        SCAN_DEVICE_TOPIC,
-        ADD_NODE_TOPIC,
-        NEW_NODE_TOPIC,
-        DELETE_NODE_TOPIC,
-        CONFIG_NODE_TOPIC,
-        KEEPALIVE_ACK_TOPIC,
-        ACTUATOR_CONTROL_TOPIC,
+        SCAN_DEVICE_TOPIC,      # BLE: scan_device / scan_result  |  WiFi: register (log only)
+        ADD_NODE_TOPIC,         # BLE: add_node  |  server sends register_ack here
+        NEW_NODE_TOPIC,         # BLE: new_node_info_ack
+        DELETE_NODE_TOPIC,      # BLE: delete_node
+        CONFIG_NODE_TOPIC,      # BLE: config_node
+        KEEPALIVE_ACK_TOPIC,    # BLE+WiFi: keep_alive / keep_alive_ack
+        ACTUATOR_CONTROL_TOPIC, # BLE+WiFi: actuator_control
+        SENSOR_DATA_TOPIC,      # WiFi: sensor_data (cache to SQLite)
+        ACTUATOR_DATA_TOPIC,    # WiFi: actuator_data / setpoint_ack
     ]
 
     client = GatewayClient(topic)
