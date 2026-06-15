@@ -47,10 +47,10 @@ KEEPALIVE_ACK_TOPIC = "farm/monitor/alive"
 # WIFI_SENSOR_TOPIC   = "farm/sensor"     # sensor_data
 # WIFI_ACTUATOR_TOPIC = "farm/actuator"   # actuator_data / setpoint / setpoint_ack
 
-# BROKER_SERVER = '192.168.2.192'     # test broker
+BROKER_SERVER = '192.168.2.32'     # test broker
 # BROKER_SERVER = '192.168.88.153'     # test broker
 # BROKER_SERVER = '192.168.2.81'     # test broker
-BROKER_SERVER = '192.168.1.217'     # ip nhà Bon
+# BROKER_SERVER = '192.168.1.217'     # ip nhà Bon
 PORT = 1883
 KEEPALIVE = 60
 
@@ -531,43 +531,61 @@ class GatewayService(dbus.service.Object):
             return
 
         if (sensor_data['protocol'] == 'ble_mesh'):
+            data = sensor_data.get('data')
+            if data is None:
+                data = {
+                    'pid': sensor_data.get('pid'),
+                    'temp': sensor_data.get('temp'),
+                    'hum': sensor_data.get('hum'),
+                    'light': sensor_data.get('light'),
+                    'co2': sensor_data.get('co2'),
+                    'motion': sensor_data.get('motion'),
+                    'dust': sensor_data.get('dust'),
+                }
+
             db = SqliteDAO(database.location)
-            data = sensor_data['data']
-            node_id = db.__do__(f"SELECT node_id FROM BTMeshNodes WHERE unicast = {sensor_data['unicast']}")
-            if node_id[0] is None:
-                print("Cannot find node ID from this unicast address")
-            else:
-                data['node_id'] = node_id[0][0]
-                print("NODE ID:", node_id)
-                record = database.RecordMaker(data)
+            node_id_rows = db.__do__(f"SELECT node_id FROM BTMeshNodes WHERE unicast = {sensor_data['unicast']}")
+            node_id = -1
+            if node_id_rows and node_id_rows[0] and node_id_rows[0][0] is not None:
+                node_id = node_id_rows[0][0]
+                db_data = dict(data)
+                db_data['node_id'] = node_id
+                print("NODE ID:", node_id_rows)
+                record = database.RecordMaker(db_data)
                 db = SqliteDAO(database.location)
                 db.insertOneRecord("SensorMonitor", record['fields'], record['values'])
                 print(f"Inserted sensor data record: {record['fields']}, {record['values']}")
                 db = SqliteDAO(database.location)
-                db.insertOneRecord("NodeHealth", ['node_id', 'battery'], (node_id[0][0], sensor_data['battery']))
-                print(f"Inserted battery data record: {sensor_data['battery']}")
+                db.insertOneRecord("NodeHealth", ['node_id', 'battery'], (node_id, sensor_data.get('battery', -1)))
+                print(f"Inserted battery data record: {sensor_data.get('battery', -1)}")
+            else:
+                print(f"Cannot find node ID from unicast address {sensor_data['unicast']}")
 
             msg = {
                 'operator': 'sensor_data',
                 'status': 1,
                 'info': {
                     'room_id': room_id,
-                    #'node_id' syntax error(BON)
-                    'node_id': node_id[0][0] if node_id and node_id[0] else -1,
+                    'node_id': node_id,
                     'protocol': 'ble_mesh',
-                    'pid': sensor_data['data']['pid'],
-                    'temp': sensor_data['data']['temp'], 
-                    'hum': sensor_data['data']['hum'],      # this name should be assigned from device
-                    'light': sensor_data['data']['light'],
-                    'co2': sensor_data['data']['co2'],
-                    'motion': sensor_data['data']['motion'],
-                    'dust': sensor_data['data']['dust'],
+                    'unicast': sensor_data['unicast'],
+                    'battery': sensor_data.get('battery', -1),
+                    'pid': data['pid'],
+                    'temp': data['temp'],
+                    'hum': data['hum'],
+                    'light': data['light'],
+                    'co2': data['co2'],
+                    'motion': data['motion'],
+                    'dust': data['dust'],
                 }
             }
             pub_msg = json.dumps(msg)
-            res = client.publish(SENSOR_DATA_TOPIC, pub_msg)
-            if (res[0] != 0):
+            res = client.publish(SENSOR_DATA_TOPIC, pub_msg, qos=1)
+            rc = res.rc if hasattr(res, 'rc') else res[0]
+            if (rc != mqtt.MQTT_ERR_SUCCESS):
                 print('Cannot send sensor data result to server')
+            else:
+                print(f"[BLE] sensor_data published to {BROKER_SERVER}:{PORT} topic={SENSOR_DATA_TOPIC}")
 
     @dbus.service.method('org.ipac.gateway', in_signature='a{sv}', out_signature='')
     def SaveSensorDataToThingsboard(self, sensor_data):

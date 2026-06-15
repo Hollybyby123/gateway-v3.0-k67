@@ -998,7 +998,7 @@ class MeshGateway():
             if gw_service is None or gw_service_interface is None:
                dbus_call_proxy_object()
             if gw_service is not None and gw_service_interface is not None:
-               gw_service_interface.SaveSensorDataToThingsboard(dbus_msg)
+               gw_service_interface.SaveSensorData(dbus_msg)
             #    return
 
     def recv_device_info_status(self):
