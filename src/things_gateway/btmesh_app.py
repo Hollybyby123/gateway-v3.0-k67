@@ -961,10 +961,21 @@ class MeshGateway():
 
     def recv_sensor_data_status(self):        # publish message
         print("Received")
-        msg = self.ser.ser.read(23)
-        id, unicast, temp, humid, light, co2, motion, dust, battery, checksum = struct.unpack('<HHffHHBfBB', msg)
+        payload_len = struct.calcsize('<HHffHHBfBB')
+        msg = self.ser.ser.read(payload_len)
+        if len(msg) != payload_len:
+            print(f'Incomplete sensor_data_status payload: expected {payload_len}, got {len(msg)}')
+            return
+
+        try:
+            id, unicast, temp, humid, light, co2, motion, dust, battery, checksum = struct.unpack('<HHffHHBfBB', msg)
+        except struct.error as e:
+            print(f'Cannot unpack sensor_data_status: {e}')
+            return
+
         if (sum(msg) + OPCODE_SENSOR_DATA_STATUS & 0xFF) != 0xFF:
             print('Wrong checksum')
+            return
         else:
             dbus_msg = {
                 'protocol': 'ble_mesh',
@@ -998,7 +1009,10 @@ class MeshGateway():
             if gw_service is None or gw_service_interface is None:
                dbus_call_proxy_object()
             if gw_service is not None and gw_service_interface is not None:
-               gw_service_interface.SaveSensorData(dbus_msg)
+               try:
+                   gw_service_interface.SaveSensorData(dbus_msg)
+               except dbus.exceptions.DBusException as e:
+                   print(f'{ts()} [DBUS] SaveSensorData failed: {e}')
             #    return
 
     def recv_device_info_status(self):
@@ -1212,9 +1226,13 @@ def btmesh_app():
             if rlist:
                 try:
                     opcode = ser.ser.read()
+                    if not opcode:
+                        retry_read += 1
+                        continue
+
                     if (opcode.hex() != '40'):
                         print(f'Opcode: {opcode.hex()} {opcode}')
-                    if (opcode is None) or (opcode == 0x00):
+                    if (opcode == b'\x00'):
                         retry_read += 1
                     else:
                         mesh_gw.read_opcode(opcode)

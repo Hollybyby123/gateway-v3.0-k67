@@ -61,10 +61,67 @@ DEV_TOPIC = "v1/gateway/telemetry"
 room_id = 407         # this must be taken from database
 
 client = None       # MQTT client
+ble_mesh_publish_cache = set()
+ble_mesh_publish_cache_lock = threading.Lock()
 
 bus = None
 btmesh_service = None
 btmesh_interface = None
+
+def sensor_cache_key(info):
+    return (
+        info.get('mac_address'),
+        info.get('node_id'),
+        info.get('packet_id'),
+        info.get('time'),
+    )
+
+def remember_ble_mesh_publish(info):
+    key = sensor_cache_key(info)
+    with ble_mesh_publish_cache_lock:
+        if len(ble_mesh_publish_cache) > 200:
+            ble_mesh_publish_cache.clear()
+        ble_mesh_publish_cache.add(key)
+
+def is_ble_mesh_publish_echo(info):
+    key = sensor_cache_key(info)
+    with ble_mesh_publish_cache_lock:
+        if key in ble_mesh_publish_cache:
+            ble_mesh_publish_cache.remove(key)
+            return True
+    return False
+
+def to_float(value, default=-1.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def to_int(value, default=-1):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def format_decimal(value):
+    return f"{to_float(value):.2f}"
+
+def fallback_mac_from_unicast(unicast):
+    unicast = max(0, min(to_int(unicast, 0), 0xFFFF))
+    return f"02:00:00:00:{(unicast >> 8) & 0xFF:02X}:{unicast & 0xFF:02X}"
+
+def lookup_btmesh_node(unicast):
+    db = SqliteDAO(database.location)
+    rows = db.__do__("SELECT node_id, mac FROM BTMeshNodes WHERE unicast = ?", (to_int(unicast),))
+    if rows and rows[0]:
+        node_id = rows[0][0] if rows[0][0] is not None else -1
+        mac_address = rows[0][1] if len(rows[0]) > 1 and rows[0][1] else fallback_mac_from_unicast(unicast)
+        return node_id, mac_address
+    return -1, fallback_mac_from_unicast(unicast)
 
 def dbus_call_proxy_object():
     global btmesh_service
@@ -136,16 +193,22 @@ def mqtt_recv_new_node_info(msg):
                         print("Conflict UUIDs with node unicast")
                 else:
                     # record = database.RecordMaker(msg['info']['dev_info'])
+                    dev_info = msg['info']['dev_info']
                     record = {
                         'fields': ['node_id', 'function', 'sync_state', 'protocol', 'time'],
-                        'values': (msg['info']['dev_info']['node_id'], msg['info']['dev_info']['function'], 1 , msg['info']['protocol'], time.time())
+                        'values': (dev_info['node_id'], dev_info['function'], 1 , msg['info']['protocol'], time.time())
                     }
                     db.insertOneRecord("Registration", record['fields'], record['values'])
                     db = SqliteDAO(database.location)
                     remote = True if (msg['info']['remote_prov']['enable'] == 1) else False
+                    btmesh_fields = ['node_id', 'uuid', 'unicast', 'remote']
+                    btmesh_values = [dev_info['node_id'], dev_info['uuid'], dev_info['unicast'], remote]
+                    if dev_info.get('mac') or dev_info.get('mac_address'):
+                        btmesh_fields.append('mac')
+                        btmesh_values.append(dev_info.get('mac') or dev_info.get('mac_address'))
                     record = {
-                        'fields': ['node_id', 'uuid', 'unicast', 'remote'],
-                        'values': (msg['info']['dev_info']['node_id'], msg['info']['dev_info']['uuid'], msg['info']['dev_info']['unicast'], remote)
+                        'fields': btmesh_fields,
+                        'values': tuple(btmesh_values)
                     }
                     db.insertOneRecord("BTMeshNodes", record['fields'], record['values'])
                     print(f"Add new node record: {record['fields']}, {record['values']}")
@@ -252,12 +315,13 @@ def wifi_recv_sensor_data(msg):
         db = SqliteDAO(database.location)
         record = database.RecordMaker({
             'node_id': info.get('node_id'),
-            'temp':    info.get('temp')  or info.get('temperature'),
-            'hum':     info.get('hum')   or info.get('humidity'),
-            'light':   info.get('light') or info.get('light_intensity'),
-            'co2':     info.get('co2'),
-            'motion':  info.get('motion'),
-            'dust':    info.get('dust')  or info.get('dust_density'),
+            'temp':    to_float(info.get('temp', info.get('temperature'))),
+            'hum':     to_float(info.get('hum', info.get('humidity'))),
+            'light':   to_float(info.get('light', info.get('light_intensity'))),
+            'co2':     to_int(info.get('co2')),
+            'motion':  to_int(info.get('motion')),
+            'dust':    to_float(info.get('dust', info.get('dust_density'))),
+            'time':    to_int(info.get('time'), int(time.time())),
         })
         db.insertOneRecord("SensorMonitor", record['fields'], record['values'])
     except Exception as e:
@@ -343,6 +407,10 @@ class GatewayClient(mqtt.Client):
             wifi_recv_keepalive(self.__msg)
 
         elif topic == SENSOR_DATA_TOPIC and op == 'sensor_data':
+            info = self.__msg.get('info', {})
+            if is_ble_mesh_publish_echo(info):
+                print(f"[BLE] ignored local MQTT echo for node_id={info.get('node_id')} packet_id={info.get('packet_id')}")
+                return
             wifi_recv_sensor_data(self.__msg)
 
         elif topic == ACTUATOR_DATA_TOPIC and op in ('actuator_data', 'setpoint_ack'):
@@ -530,7 +598,7 @@ class GatewayService(dbus.service.Object):
             print("Room ID is unknown.")
             return
 
-        if (sensor_data['protocol'] == 'ble_mesh'):
+        if (sensor_data.get('protocol') == 'ble_mesh'):
             data = sensor_data.get('data')
             if data is None:
                 data = {
@@ -543,14 +611,25 @@ class GatewayService(dbus.service.Object):
                     'dust': sensor_data.get('dust'),
                 }
 
-            db = SqliteDAO(database.location)
-            node_id_rows = db.__do__(f"SELECT node_id FROM BTMeshNodes WHERE unicast = {sensor_data['unicast']}")
-            node_id = -1
-            if node_id_rows and node_id_rows[0] and node_id_rows[0][0] is not None:
-                node_id = node_id_rows[0][0]
-                db_data = dict(data)
-                db_data['node_id'] = node_id
-                print("NODE ID:", node_id_rows)
+            unicast = sensor_data.get('unicast')
+            if unicast is None:
+                print("[BLE] Missing unicast in sensor_data")
+                return
+
+            node_id, mac_address = lookup_btmesh_node(unicast)
+            if node_id != -1:
+                db = SqliteDAO(database.location)
+                db_data = {
+                    'node_id': node_id,
+                    'temp': to_float(data.get('temp')),
+                    'hum': to_float(data.get('hum')),
+                    'light': to_float(data.get('light')),
+                    'co2': to_int(data.get('co2')),
+                    'motion': to_int(data.get('motion')),
+                    'dust': to_float(data.get('dust')),
+                    'time': int(time.time()),
+                }
+                print("NODE ID:", node_id)
                 record = database.RecordMaker(db_data)
                 db = SqliteDAO(database.location)
                 db.insertOneRecord("SensorMonitor", record['fields'], record['values'])
@@ -559,27 +638,30 @@ class GatewayService(dbus.service.Object):
                 db.insertOneRecord("NodeHealth", ['node_id', 'battery'], (node_id, sensor_data.get('battery', -1)))
                 print(f"Inserted battery data record: {sensor_data.get('battery', -1)}")
             else:
-                print(f"Cannot find node ID from unicast address {sensor_data['unicast']}")
+                print(f"Cannot find node ID from unicast address {unicast}")
 
+            packet_time = int(time.time())
             msg = {
                 'operator': 'sensor_data',
-                'status': 1,
                 'info': {
-                    'room_id': room_id,
+                    'mac_address': mac_address,
                     'node_id': node_id,
+                    'room_id': room_id,
+                    'time': packet_time,
+                    'packet_id': to_int(data.get('pid'), 0),
+                    'temperature': format_decimal(data.get('temp')),
+                    'humidity': format_decimal(data.get('hum')),
                     'protocol': 'ble_mesh',
-                    'unicast': sensor_data['unicast'],
-                    'battery': sensor_data.get('battery', -1),
-                    'pid': data['pid'],
-                    'temp': data['temp'],
-                    'hum': data['hum'],
-                    'light': data['light'],
-                    'co2': data['co2'],
-                    'motion': data['motion'],
-                    'dust': data['dust'],
+                    'co2': to_int(data.get('co2')),
+                    'dust_density': to_float(data.get('dust')),
+                    'motion': to_int(data.get('motion')),
                 }
             }
             pub_msg = json.dumps(msg)
+            remember_ble_mesh_publish(msg['info'])
+            if client is None:
+                print('[BLE] Cannot publish sensor_data: MQTT client is not ready')
+                return
             res = client.publish(SENSOR_DATA_TOPIC, pub_msg, qos=1)
             rc = res.rc if hasattr(res, 'rc') else res[0]
             if (rc != mqtt.MQTT_ERR_SUCCESS):
