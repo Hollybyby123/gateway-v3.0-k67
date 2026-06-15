@@ -1,9 +1,15 @@
 import calendar
 import datetime
+import sys
 from multiprocessing import Process
 from src.gateway_server import gw2sv
 from src.things_gateway import btmesh_app
 from src.shared import database
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
 
 class MultiTasks():
     def __init__(self, tasks):

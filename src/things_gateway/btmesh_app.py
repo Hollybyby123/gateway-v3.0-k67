@@ -23,6 +23,7 @@ RESTART_STATE = 3
 
 # USB port
 USB_PORT = '/dev/ttyUSB0'
+SERIAL_IDLE_LOG_INTERVAL = 10
 USB_BAUDRATE= 9600 #cần phải đồng bộ với esp32(Bon)
 
 # opcode
@@ -297,6 +298,7 @@ class MeshGateway():
 
     def read_opcode(self, op_byte):
         opcode = int.from_bytes(op_byte, byteorder='little') & 0xFF
+        print(f'{ts()} [BTMESH] dispatch opcode=0x{opcode:02X}', flush=True)
         if (opcode == OPCODE_GET_LOCAL_KEYS):
             self.recv_get_local_keys()
         elif (opcode == OPCODE_UPDATE_LOCAL_KEYS):
@@ -960,21 +962,21 @@ class MeshGateway():
             gw_service_interface.BtmeshScanResult(dbus_msg)
 
     def recv_sensor_data_status(self):        # publish message
-        print("Received")
+        print(f'{ts()} [BTMESH] Received sensor_data_status', flush=True)
         payload_len = struct.calcsize('<HHffHHBfBB')
         msg = self.ser.ser.read(payload_len)
         if len(msg) != payload_len:
-            print(f'Incomplete sensor_data_status payload: expected {payload_len}, got {len(msg)}')
+            print(f'Incomplete sensor_data_status payload: expected {payload_len}, got {len(msg)}', flush=True)
             return
 
         try:
             id, unicast, temp, humid, light, co2, motion, dust, battery, checksum = struct.unpack('<HHffHHBfBB', msg)
         except struct.error as e:
-            print(f'Cannot unpack sensor_data_status: {e}')
+            print(f'Cannot unpack sensor_data_status: {e}', flush=True)
             return
 
         if (sum(msg) + OPCODE_SENSOR_DATA_STATUS & 0xFF) != 0xFF:
-            print('Wrong checksum')
+            print('Wrong checksum', flush=True)
             return
         else:
             dbus_msg = {
@@ -998,7 +1000,7 @@ class MeshGateway():
                 'motion': motion,
                 'dust': dust,
             }
-            print(dbus_msg)
+            print(dbus_msg, flush=True)
             
             # csv_filename = 'btmesh_sensor.csv'
             # csv_headers = ['unicast', 'pid', 'temp', 'hum', 'light', 'co2', 'motion', 'dust']
@@ -1012,7 +1014,7 @@ class MeshGateway():
                try:
                    gw_service_interface.SaveSensorData(dbus_msg)
                except dbus.exceptions.DBusException as e:
-                   print(f'{ts()} [DBUS] SaveSensorData failed: {e}')
+                   print(f'{ts()} [DBUS] SaveSensorData failed: {e}', flush=True)
             #    return
 
     def recv_device_info_status(self):
@@ -1205,8 +1207,10 @@ def btmesh_app():
     global ser
     state = INITIAL_STATE
     retry_read = 0
+    last_idle_log = time.time()
     ser = UART(USB_PORT, USB_BAUDRATE)
     mesh_gw = MeshGateway(ser)
+    print(f'{ts()} [BTMESH] serial worker started port={USB_PORT} baud={USB_BAUDRATE}', flush=True)
 
     while True:
         if ser is None:
@@ -1230,16 +1234,19 @@ def btmesh_app():
                         retry_read += 1
                         continue
 
-                    if (opcode.hex() != '40'):
-                        print(f'Opcode: {opcode.hex()} {opcode}')
+                    print(f'{ts()} [BTMESH] opcode byte=0x{opcode.hex()}', flush=True)
                     if (opcode == b'\x00'):
                         retry_read += 1
                     else:
                         mesh_gw.read_opcode(opcode)
                 except serial.SerialException:
                     retry_read += 1
-            # else:
-            #     print('No response')
+            else:
+                now = time.time()
+                if now - last_idle_log >= SERIAL_IDLE_LOG_INTERVAL:
+                    in_waiting = getattr(ser.ser, 'in_waiting', 'unknown')
+                    print(f'{ts()} [BTMESH] waiting for serial data... in_waiting={in_waiting}', flush=True)
+                    last_idle_log = now
 
             if (retry_read > 5):
                 state = RESTART_STATE

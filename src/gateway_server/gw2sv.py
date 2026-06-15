@@ -32,6 +32,7 @@ from gi.repository import GLib  # type: ignore
 SENSOR_DATA_TOPIC = "farm/monitor/sensor"
 ACTUATOR_DATA_TOPIC = "farm/monitor/actuator"
 ACTUATOR_CONTROL_TOPIC = "farm/control"
+BLE_MESH_CONVERTED_PROTOCOL = "ble_mesh"
 
 SCAN_DEVICE_TOPIC = "farm/node/scan"
 ADD_NODE_TOPIC = "farm/node/add"
@@ -348,9 +349,11 @@ class GatewayClient(mqtt.Client):
         """Called when the broker responds to our connection request"""
         # The connection result
         if rc == 0:
+            print(f"[GW MQTT] connected broker={BROKER_SERVER}:{PORT} ble_converted_protocol={BLE_MESH_CONVERTED_PROTOCOL}", flush=True)
             self.__logger.info("Connected to broker")
             for topic in self.__topic:
                 self.subscribe(topic)
+                print(f"[GW MQTT] subscribed topic={topic}", flush=True)
     
     def on_connect_fail(self, client, userdata):
         """Called when the client failed to connect to the broker"""
@@ -366,7 +369,7 @@ class GatewayClient(mqtt.Client):
         try:
             self.__msg = json.loads(msg.payload.decode())
         except Exception as e:
-            print(f"[MQTT] Bad payload on {msg.topic}: {e}")
+            print(f"[MQTT] Bad payload on {msg.topic}: {e}", flush=True)
             return
 
         if room_id is None:
@@ -651,12 +654,13 @@ class GatewayService(dbus.service.Object):
                     'packet_id': to_int(data.get('pid'), 0),
                     'temperature': format_decimal(data.get('temp')),
                     'humidity': format_decimal(data.get('hum')),
-                    'protocol': 'ble_mesh',
+                    'protocol': BLE_MESH_CONVERTED_PROTOCOL,
                     'co2': to_int(data.get('co2')),
                     'dust_density': to_float(data.get('dust')),
                     'motion': to_int(data.get('motion')),
                 }
             }
+            msg['info']['protocol'] = BLE_MESH_CONVERTED_PROTOCOL
             pub_msg = json.dumps(msg)
             remember_ble_mesh_publish(msg['info'])
             if client is None:
@@ -667,7 +671,8 @@ class GatewayService(dbus.service.Object):
             if (rc != mqtt.MQTT_ERR_SUCCESS):
                 print('Cannot send sensor data result to server')
             else:
-                print(f"[BLE] sensor_data published to {BROKER_SERVER}:{PORT} topic={SENSOR_DATA_TOPIC}")
+                print(f"[BLE] sensor_data payload={pub_msg}", flush=True)
+                print(f"[BLE] sensor_data published to {BROKER_SERVER}:{PORT} topic={SENSOR_DATA_TOPIC}", flush=True)
 
     @dbus.service.method('org.ipac.gateway', in_signature='a{sv}', out_signature='')
     def SaveSensorDataToThingsboard(self, sensor_data):
@@ -733,6 +738,7 @@ def mqtt_handler():
 
     client = GatewayClient(topic)
     # client.username_pw_set(access_token)
+    print(f"[GW MQTT] starting broker={BROKER_SERVER}:{PORT} topics={topic}", flush=True)
     client.connect(BROKER_SERVER, PORT, KEEPALIVE)
     client.loop_forever()
 
@@ -740,6 +746,7 @@ def main():
     mqtt_handler_thread = threading.Thread(target=mqtt_handler)
     dbus_handler_thread = threading.Thread(target=dbus_handler)
 
+    print(f"[GW] gateway process started ble_converted_protocol={BLE_MESH_CONVERTED_PROTOCOL}", flush=True)
     mqtt_handler_thread.start()
     dbus_handler_thread.start()
 
