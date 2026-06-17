@@ -18,35 +18,43 @@ class SqliteDAO:
 
     def __connect__(self):
         try:
-            self.__conn = sqlite3.connect(self.__dbLocation)
-            self.__conn.cursor().execute("PRAGMA foreign_keys = ON;")
+            self.__conn = sqlite3.connect(self.__dbLocation, timeout=30)
+            self.__conn.execute("PRAGMA foreign_keys = ON;")
         except sqlite3.Error as error:
             self.__logger.exception(error)
             print("Connect database failed!")
 
     def __do__(self, query: str, params=None) -> list[tuple]:
+        cur = None
         try:
             self.__connect__()
+            if self.__conn is None:
+                return []
             cur = self.__conn.cursor()
             if (params):
                 cur.execute(query, params)
             else:
                 cur.execute(query)
             values = cur.fetchall()
-            self.__close__()
             return values
         except sqlite3.Error as error:
             self.__logger.exception(error)
             #print(f"Do {query} failed!")
             print(error)
+            return []
+        finally:
+            if cur is not None:
+                cur.close()
+            self.__close__()
     # brief: method to close a connection to sqlite3
     #
 
     def __close__(self):
         try:
-            self.__conn.commit()
-            self.__conn.cursor().close()
-            self.__conn.close()
+            if self.__conn is not None:
+                self.__conn.commit()
+                self.__conn.close()
+                self.__conn = None
         except sqlite3.Error as error:
             self.__logger.exception(error)
             print("Close database failed!")
@@ -58,21 +66,29 @@ class SqliteDAO:
     #       3. log the message to logger
     #       4. close the connection afterward
     def createTable(self, tableName: str, colName: str):
+        cur = None
         try:
             self.__connect__()
+            if self.__conn is None:
+                return
             cur = self.__conn.cursor()
-            cur.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{tableName}';")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (tableName,))
             result = cur.fetchone()
             if result is None:
-                self.__do__(f"CREATE TABLE {tableName} ({colName});")
+                cur.execute(f"CREATE TABLE {tableName} ({colName});")
+                self.__conn.commit()
                 print(f"CREATE TABLE {tableName} successfully")
                 self.__logger.info(
                     f"Created table {tableName} successfully")
             else:
                 print(f"{tableName} already exists in the database.")
         except sqlite3.Error as error:
-            self.__logger.info("Created table {tableName} unsuccessfully")
+            self.__logger.info(f"Created table {tableName} unsuccessfully")
             self.__logger.exception(error)
+        finally:
+            if cur is not None:
+                cur.close()
+            self.__close__()
 
     # brief: method to insert a record to a tableName
     #       1. open a connection to a database
@@ -135,14 +151,11 @@ class SqliteDAO:
     # # TODO: use rowid
     def updateOneRecord(self, tableName, new, condition):
         try:
-            self.__connect__()
             self.__do__(f"UPDATE {tableName} SET {new} WHERE {condition}")
             self.__logger.info("Updated a record successfully")
         except sqlite3.Error as error:
             self.__logger.info("Updated a record unsuccessfully")
             self.__logger.exception(error)
-        finally:
-            self.__close__()
 
     # # DELETE
     # def deleteOneRecord(self, tableName, condition):

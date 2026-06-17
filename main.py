@@ -1,6 +1,7 @@
 import calendar
 import datetime
 import sys
+import time
 from multiprocessing import Process
 from src.gateway_server import gw2sv
 from src.things_gateway import btmesh_app
@@ -50,3 +51,4 @@ while True:
         multi_tasks.restart()
         database.createDatabaseSchedule()
         preMonth = newMonth
+    time.sleep(60)

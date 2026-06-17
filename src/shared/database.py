@@ -1,5 +1,6 @@
 import sqlite3
 import datetime
+import os
 from lib.dao import SqliteDAO
 
 location = "./data/data.db"
@@ -73,9 +74,10 @@ def createDatabase():
 def createDatabaseSchedule():
     db = SqliteDAO(location)
     items = db.__do__(f"SELECT * FROM Registration")
-    date = datetime.datetime.utcfromtimestamp(now())
+    date = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
     newFileName = f"./data/data_{date.month}_{date.year}.db"
-    os.rename("./data/data.db", newFileName)
+    if os.path.exists(location):
+        os.rename(location, newFileName)
     createDatabase()
     db = SqliteDAO(location)
     for item in items:
@@ -94,5 +96,3 @@ def RecordMaker(dict_data) -> dict:
 
     record['values'] = tuple(values)
     return record
-    
-    
